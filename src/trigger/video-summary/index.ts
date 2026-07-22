@@ -19,7 +19,7 @@ export const videoSummaryTask = task({
 
     // Initialize Gemini client
     const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
     // Extract video ID from YouTube URL
     const videoId = extractVideoId(videoUrl);

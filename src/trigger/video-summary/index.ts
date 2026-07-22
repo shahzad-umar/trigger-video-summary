@@ -1,20 +1,9 @@
 import { task } from "@trigger.dev/sdk";
-import { exec } from "child_process";
-import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
 
-const execAsync = promisify(exec);
-
 interface VideoSummaryInput {
   videoUrl: string;
-}
-
-interface FrameAnalysis {
-  timestamp: number;
-  isInfographic: boolean;
-  description: string;
-  mermaidDiagram?: string;
 }
 
 export const videoSummaryTask = task({
@@ -22,14 +11,12 @@ export const videoSummaryTask = task({
   run: async (payload: VideoSummaryInput) => {
     const { videoUrl } = payload;
 
-    // Validate environment variables
     const youtubeApiKey = process.env.YOUTUBE_API_KEY;
     const mistralApiKey = process.env.MISTRAL_API_KEY;
 
     if (!youtubeApiKey) throw new Error("YOUTUBE_API_KEY is not set");
     if (!mistralApiKey) throw new Error("MISTRAL_API_KEY is not set");
 
-    // Extract video ID from YouTube URL
     const videoId = extractVideoId(videoUrl);
     if (!videoId) throw new Error("Invalid YouTube URL");
 
@@ -41,7 +28,7 @@ export const videoSummaryTask = task({
 
     console.log(`Video title: ${videoTitle}`);
 
-    // Step 2: Get transcript
+    // Step 2: Get transcript via free API
     const transcript = await getTranscript(videoId);
     if (!transcript) {
       throw new Error("Could not extract transcript from video");
@@ -49,50 +36,22 @@ export const videoSummaryTask = task({
 
     console.log(`Transcript extracted: ${transcript.substring(0, 100)}...`);
 
-    // Step 3: Download video and extract frames
-    const videoPath = await downloadVideo(videoId);
-    const frames = await extractFrames(videoPath, videoId);
-
-    console.log(`Extracted ${frames.length} frames`);
-
-    // Step 4: Analyze frames with Mistral Vision (sample first 10 frames)
-    const frameAnalyses: FrameAnalysis[] = [];
-    const framesToAnalyze = frames.slice(0, Math.min(10, frames.length));
-
-    for (let i = 0; i < framesToAnalyze.length; i++) {
-      const frame = framesToAnalyze[i];
-      const analysis = await analyzeFrame(mistralApiKey, frame.path, frame.timestamp);
-      frameAnalyses.push(analysis);
-      console.log(`Analyzed frame ${i + 1}/${framesToAnalyze.length}`);
-    }
-
-    // Step 5: Summarize transcript with Mistral
+    // Step 3: Summarize transcript with Mistral
     const summary = await summarizeTranscript(mistralApiKey, transcript);
 
-    // Step 6: Generate Mermaid diagrams from transcript content
+    // Step 4: Generate Mermaid diagrams from transcript content
     const diagrams = await generateDiagrams(mistralApiKey, transcript);
 
-    // Step 7: Generate markdown output
-    const markdown = generateMarkdown(
-      videoTitle,
-      summary,
-      frameAnalyses,
-      diagrams
-    );
+    // Step 5: Generate markdown output
+    const markdown = generateMarkdown(videoTitle, summary, diagrams);
 
     console.log("\n=== VIDEO SUMMARY ===\n");
     console.log(markdown);
-
-    // Cleanup
-    await cleanup(videoPath);
-    await cleanupFrames(`frames-${videoId}`);
 
     return {
       videoId,
       videoTitle,
       summary,
-      frameCount: frames.length,
-      analyzedFrames: frameAnalyses.length,
       markdown,
     };
   },
@@ -140,134 +99,59 @@ async function getVideoMetadata(
 
 async function getTranscript(videoId: string): Promise<string> {
   try {
-    await execAsync(
-      `yt-dlp --write-auto-sub --sub-lang en --skip-download -o "%(id)s" "${videoId}"`
-    );
+    const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`);
+    const html = await response.text();
 
-    const subFile = `${videoId}.en.vtt`;
-    if (fs.existsSync(subFile)) {
-      let content = fs.readFileSync(subFile, "utf-8");
-      content = content
-        .replace(/WEBVTT\n\n/, "")
-        .replace(/^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\n/gm, "")
-        .replace(/\n\n/g, " ");
-      fs.unlinkSync(subFile);
-      return content;
+    const captionsMatch = html.match(/"captions":\s*(\{[^}]+\})/);
+    if (!captionsMatch) {
+      console.log("No captions found, trying alternative method...");
+      return await getTranscriptFromYoutubeDirect(videoId);
     }
 
-    return "";
-  } catch (error) {
-    console.error("Error fetching transcript:", error);
-    return "";
-  }
-}
+    const captionsJson = JSON.parse(captionsMatch[1]);
+    const trackUrl = captionsJson?.playerCaptionsTracklistRenderer?.tracks?.[0]?.baseUrl;
 
-async function downloadVideo(videoId: string): Promise<string> {
-  const videoPath = `/tmp/${videoId}.mp4`;
-
-  try {
-    await execAsync(
-      `yt-dlp -f "best[ext=mp4]" -o "${videoPath}" "https://www.youtube.com/watch?v=${videoId}"`
-    );
-    console.log(`Downloaded video to ${videoPath}`);
-    return videoPath;
-  } catch (error) {
-    console.error("Error downloading video:", error);
-    throw new Error("Failed to download video");
-  }
-}
-
-async function extractFrames(
-  videoPath: string,
-  videoId: string
-): Promise<Array<{ path: string; timestamp: number }>> {
-  const framesDir = `/tmp/frames-${videoId}`;
-
-  if (!fs.existsSync(framesDir)) {
-    fs.mkdirSync(framesDir, { recursive: true });
-  }
-
-  try {
-    await execAsync(
-      `ffmpeg -i "${videoPath}" -vf "fps=1/15" "${framesDir}/frame-%03d.jpg" -loglevel error`
-    );
-
-    const files = fs.readdirSync(framesDir).sort();
-    const frames = files.map((file, index) => ({
-      path: path.join(framesDir, file),
-      timestamp: index * 15,
-    }));
-
-    console.log(`Extracted ${frames.length} frames`);
-    return frames;
-  } catch (error) {
-    console.error("Error extracting frames:", error);
-    return [];
-  }
-}
-
-async function analyzeFrame(
-  mistralApiKey: string,
-  framePath: string,
-  timestamp: number
-): Promise<FrameAnalysis> {
-  try {
-    const imageData = fs.readFileSync(framePath);
-    const base64Image = imageData.toString("base64");
-
-    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${mistralApiKey}`,
-      },
-      body: JSON.stringify({
-        model: "pixtral-12b-2409",
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: `Analyze this video frame at ${timestamp}s.
-Is this an infographic, diagram, chart, or process flow?
-If yes, describe it briefly (1-2 sentences). If no, just say "no infographic".
-Format: IS_INFOGRAPHIC: [yes/no] | DESCRIPTION: [description]`,
-              },
-              {
-                type: "image_url",
-                image_url: `data:image/jpeg;base64,${base64Image}`,
-              },
-            ],
-          },
-        ],
-      }),
-    });
-
-    const data = (await response.json()) as any;
-    const text = data.choices[0].message.content;
-
-    let isInfographic = false;
-    let description = "";
-
-    if (text.includes("yes")) {
-      isInfographic = true;
-      const descStart = text.indexOf("DESCRIPTION:") + 12;
-      description = text.substring(descStart).trim().split("\n")[0];
+    if (!trackUrl) {
+      return await getTranscriptFromYoutubeDirect(videoId);
     }
 
-    return {
-      timestamp,
-      isInfographic,
-      description,
-    };
+    const captionResponse = await fetch(trackUrl);
+    const captionText = await captionResponse.text();
+
+    let transcript = captionText
+      .replace(/<[^>]+>/g, "")
+      .split("\n")
+      .filter(line => line.trim().length > 0)
+      .join(" ");
+
+    return transcript;
   } catch (error) {
-    console.error(`Error analyzing frame at ${timestamp}s:`, error);
-    return {
-      timestamp,
-      isInfographic: false,
-      description: "Could not analyze frame",
-    };
+    console.error("Error fetching transcript from page:", error);
+    return await getTranscriptFromYoutubeDirect(videoId);
+  }
+}
+
+async function getTranscriptFromYoutubeDirect(videoId: string): Promise<string> {
+  try {
+    const response = await fetch(
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=vtt`
+    );
+
+    if (!response.ok) {
+      throw new Error("Failed to fetch transcript");
+    }
+
+    const vttContent = await response.text();
+    let transcript = vttContent
+      .replace(/WEBVTT\n\n/, "")
+      .replace(/^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\n/gm, "")
+      .replace(/\n\n/g, " ")
+      .replace(/<[^>]+>/g, "");
+
+    return transcript;
+  } catch (error) {
+    console.error("Error fetching transcript directly:", error);
+    return "";
   }
 }
 
@@ -351,52 +235,15 @@ Format each diagram as:
 function generateMarkdown(
   title: string,
   summary: string,
-  frameAnalyses: FrameAnalysis[],
   diagrams: string
 ): string {
   let markdown = `# ${title}\n\n`;
 
   markdown += `## Summary\n\n${summary}\n\n`;
 
-  // Add visual content
-  const infographics = frameAnalyses.filter((f) => f.isInfographic);
-  if (infographics.length > 0) {
-    markdown += `## Visual Content from Video\n\n`;
-
-    for (const infographic of infographics) {
-      markdown += `### Screenshot at ${infographic.timestamp}s\n`;
-      markdown += `${infographic.description}\n\n`;
-    }
-  }
-
-  // Add generated diagrams
   if (diagrams && diagrams.trim().length > 0) {
     markdown += `## Concept Diagrams\n\n${diagrams}\n\n`;
   }
 
   return markdown;
-}
-
-async function cleanup(videoPath: string): Promise<void> {
-  try {
-    if (fs.existsSync(videoPath)) {
-      fs.unlinkSync(videoPath);
-    }
-  } catch (error) {
-    console.error("Error cleaning up video:", error);
-  }
-}
-
-async function cleanupFrames(framesDir: string): Promise<void> {
-  try {
-    if (fs.existsSync(framesDir)) {
-      const files = fs.readdirSync(framesDir);
-      for (const file of files) {
-        fs.unlinkSync(path.join(framesDir, file));
-      }
-      fs.rmdirSync(framesDir);
-    }
-  } catch (error) {
-    console.error("Error cleaning up frames:", error);
-  }
 }

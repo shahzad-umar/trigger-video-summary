@@ -10,8 +10,7 @@
   },
   "dependencies": {
     "@trigger.dev/sdk": "4.5.6",
-    "@google/generative-ai": "^0.11.0",
-    "googleapis": "^141.0.0"
+    "@google/generative-ai": "^0.11.0"
   },
   "devDependencies": {
     "typescript": "^5.3.0",

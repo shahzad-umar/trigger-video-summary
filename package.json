@@ -4,16 +4,17 @@
   "description": "Video summary automation using Trigger.dev",
   "type": "module",
   "scripts": {
-    "dev": "trigger.dev@latest dev",
+    "dev": "npx trigger.dev@latest dev",
     "build": "tsc",
-    "deploy": "trigger.dev@latest deploy"
+    "deploy": "npx trigger.dev@latest deploy"
   },
   "dependencies": {
-    "@trigger.dev/sdk": "4.5.6",
-    "@google/generative-ai": "^0.11.0"
+    "@google/generative-ai": "^0.11.0",
+    "@trigger.dev/sdk": "4.5.6"
   },
   "devDependencies": {
-    "typescript": "^5.3.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.3.0"
   }
 }

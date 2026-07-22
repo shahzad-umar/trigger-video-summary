@@ -3,7 +3,6 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const execAsync = promisify(exec);
 
@@ -25,14 +24,10 @@ export const videoSummaryTask = task({
 
     // Validate environment variables
     const youtubeApiKey = process.env.YOUTUBE_API_KEY;
-    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const mistralApiKey = process.env.MISTRAL_API_KEY;
 
     if (!youtubeApiKey) throw new Error("YOUTUBE_API_KEY is not set");
-    if (!geminiApiKey) throw new Error("GEMINI_API_KEY is not set");
-
-    // Initialize Gemini client
-    const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    if (!mistralApiKey) throw new Error("MISTRAL_API_KEY is not set");
 
     // Extract video ID from YouTube URL
     const videoId = extractVideoId(videoUrl);
@@ -60,24 +55,29 @@ export const videoSummaryTask = task({
 
     console.log(`Extracted ${frames.length} frames`);
 
-    // Step 4: Analyze frames with Gemini Vision
+    // Step 4: Analyze frames with Mistral Vision (sample first 10 frames)
     const frameAnalyses: FrameAnalysis[] = [];
-    for (let i = 0; i < frames.length; i++) {
-      const frame = frames[i];
-      const analysis = await analyzeFrame(model, frame.path, frame.timestamp);
+    const framesToAnalyze = frames.slice(0, Math.min(10, frames.length));
+
+    for (let i = 0; i < framesToAnalyze.length; i++) {
+      const frame = framesToAnalyze[i];
+      const analysis = await analyzeFrame(mistralApiKey, frame.path, frame.timestamp);
       frameAnalyses.push(analysis);
-      console.log(`Analyzed frame ${i + 1}/${frames.length}`);
+      console.log(`Analyzed frame ${i + 1}/${framesToAnalyze.length}`);
     }
 
-    // Step 5: Summarize transcript with Gemini
-    const summary = await summarizeTranscript(model, transcript);
+    // Step 5: Summarize transcript with Mistral
+    const summary = await summarizeTranscript(mistralApiKey, transcript);
 
-    // Step 6: Generate markdown output
+    // Step 6: Generate Mermaid diagrams from transcript content
+    const diagrams = await generateDiagrams(mistralApiKey, transcript);
+
+    // Step 7: Generate markdown output
     const markdown = generateMarkdown(
       videoTitle,
       summary,
       frameAnalyses,
-      frames
+      diagrams
     );
 
     console.log("\n=== VIDEO SUMMARY ===\n");
@@ -85,12 +85,14 @@ export const videoSummaryTask = task({
 
     // Cleanup
     await cleanup(videoPath);
+    await cleanupFrames(`frames-${videoId}`);
 
     return {
       videoId,
       videoTitle,
       summary,
       frameCount: frames.length,
+      analyzedFrames: frameAnalyses.length,
       markdown,
     };
   },
@@ -138,16 +140,13 @@ async function getVideoMetadata(
 
 async function getTranscript(videoId: string): Promise<string> {
   try {
-    // Try to fetch captions using yt-dlp via exec
     await execAsync(
       `yt-dlp --write-auto-sub --sub-lang en --skip-download -o "%(id)s" "${videoId}"`
     );
 
-    // Read the subtitle file
     const subFile = `${videoId}.en.vtt`;
     if (fs.existsSync(subFile)) {
       let content = fs.readFileSync(subFile, "utf-8");
-      // Remove VTT formatting
       content = content
         .replace(/WEBVTT\n\n/, "")
         .replace(/^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\n/gm, "")
@@ -189,9 +188,8 @@ async function extractFrames(
   }
 
   try {
-    // Extract frames every 15 seconds
     await execAsync(
-      `ffmpeg -i "${videoPath}" -vf "fps=1/15" "${framesDir}/frame-%03d.jpg"`
+      `ffmpeg -i "${videoPath}" -vf "fps=1/15" "${framesDir}/frame-%03d.jpg" -loglevel error`
     );
 
     const files = fs.readdirSync(framesDir).sort();
@@ -209,7 +207,7 @@ async function extractFrames(
 }
 
 async function analyzeFrame(
-  model: any,
+  mistralApiKey: string,
   framePath: string,
   timestamp: number
 ): Promise<FrameAnalysis> {
@@ -217,49 +215,51 @@ async function analyzeFrame(
     const imageData = fs.readFileSync(framePath);
     const base64Image = imageData.toString("base64");
 
-    const response = await model.generateContent([
-      {
-        inlineData: {
-          data: base64Image,
-          mimeType: "image/jpeg",
-        },
+    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${mistralApiKey}`,
       },
-      {
-        text: `Analyze this frame from a video at timestamp ${timestamp}s.
+      body: JSON.stringify({
+        model: "pixtral-12b-2409",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `Analyze this video frame at ${timestamp}s.
+Is this an infographic, diagram, chart, or process flow?
+If yes, describe it briefly (1-2 sentences). If no, just say "no infographic".
+Format: IS_INFOGRAPHIC: [yes/no] | DESCRIPTION: [description]`,
+              },
+              {
+                type: "image_url",
+                image_url: `data:image/jpeg;base64,${base64Image}`,
+              },
+            ],
+          },
+        ],
+      }),
+    });
 
-        1. Is this an infographic, diagram, chart, or visual instruction? Answer yes or no.
-        2. Briefly describe what you see (1-2 sentences).
-        3. If it's an infographic/diagram, provide a Mermaid diagram representation.
-
-        Format your response as:
-        IS_INFOGRAPHIC: [yes/no]
-        DESCRIPTION: [description]
-        MERMAID: [optional mermaid code block if applicable]`,
-      },
-    ]);
-
-    const text = response.response.text();
-    const lines = text.split("\n");
+    const data = (await response.json()) as any;
+    const text = data.choices[0].message.content;
 
     let isInfographic = false;
     let description = "";
-    let mermaidDiagram: string | undefined;
 
-    for (const line of lines) {
-      if (line.startsWith("IS_INFOGRAPHIC:")) {
-        isInfographic = line.includes("yes");
-      } else if (line.startsWith("DESCRIPTION:")) {
-        description = line.replace("DESCRIPTION:", "").trim();
-      } else if (line.startsWith("MERMAID:")) {
-        mermaidDiagram = line.replace("MERMAID:", "").trim();
-      }
+    if (text.includes("yes")) {
+      isInfographic = true;
+      const descStart = text.indexOf("DESCRIPTION:") + 12;
+      description = text.substring(descStart).trim().split("\n")[0];
     }
 
     return {
       timestamp,
       isInfographic,
       description,
-      mermaidDiagram,
     };
   } catch (error) {
     console.error(`Error analyzing frame at ${timestamp}s:`, error);
@@ -272,24 +272,79 @@ async function analyzeFrame(
 }
 
 async function summarizeTranscript(
-  model: any,
+  mistralApiKey: string,
   transcript: string
 ): Promise<string> {
   try {
-    const response = await model.generateContent(`
-    Summarize the following video transcript into a nested bulleted list.
-    Each main topic should be a top-level bullet, with key points as sub-bullets.
-    Keep each point to 1-2 sentences maximum.
+    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${mistralApiKey}`,
+      },
+      body: JSON.stringify({
+        model: "mistral-small-latest",
+        messages: [
+          {
+            role: "user",
+            content: `Summarize the following video transcript into a nested bulleted list.
+Each main topic should be a top-level bullet, with key points as sub-bullets.
+Keep each point to 1-2 sentences maximum.
 
-    Transcript:
-    ${transcript}
+Transcript:
+${transcript}
 
-    Format the output as a clean bulleted markdown list.`);
+Format the output as a clean bulleted markdown list.`,
+          },
+        ],
+      }),
+    });
 
-    return response.response.text();
+    const data = (await response.json()) as any;
+    return data.choices[0].message.content;
   } catch (error) {
     console.error("Error summarizing transcript:", error);
     throw new Error("Failed to summarize transcript");
+  }
+}
+
+async function generateDiagrams(
+  mistralApiKey: string,
+  transcript: string
+): Promise<string> {
+  try {
+    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${mistralApiKey}`,
+      },
+      body: JSON.stringify({
+        model: "mistral-small-latest",
+        messages: [
+          {
+            role: "user",
+            content: `Based on this video transcript, create 1-2 Mermaid diagrams that visualize the key concepts or processes.
+Choose the most appropriate diagram type (flowchart, graph, mindmap, etc.).
+Provide ONLY the Mermaid code blocks, no explanation.
+
+Transcript excerpt:
+${transcript.substring(0, 2000)}...
+
+Format each diagram as:
+\`\`\`mermaid
+[diagram code]
+\`\`\``,
+          },
+        ],
+      }),
+    });
+
+    const data = (await response.json()) as any;
+    return data.choices[0].message.content;
+  } catch (error) {
+    console.error("Error generating diagrams:", error);
+    return "";
   }
 }
 
@@ -297,7 +352,7 @@ function generateMarkdown(
   title: string,
   summary: string,
   frameAnalyses: FrameAnalysis[],
-  frames: Array<{ path: string; timestamp: number }>
+  diagrams: string
 ): string {
   let markdown = `# ${title}\n\n`;
 
@@ -306,27 +361,17 @@ function generateMarkdown(
   // Add visual content
   const infographics = frameAnalyses.filter((f) => f.isInfographic);
   if (infographics.length > 0) {
-    markdown += `## Visual Content & Diagrams\n\n`;
+    markdown += `## Visual Content from Video\n\n`;
 
     for (const infographic of infographics) {
-      if (infographic.mermaidDiagram) {
-        markdown += `### At ${infographic.timestamp}s\n\n`;
-        markdown += `\`\`\`mermaid\n${infographic.mermaidDiagram}\n\`\`\`\n\n`;
-        markdown += `${infographic.description}\n\n`;
-      }
+      markdown += `### Screenshot at ${infographic.timestamp}s\n`;
+      markdown += `${infographic.description}\n\n`;
     }
   }
 
-  // Add key frames
-  const keyFrames = frameAnalyses
-    .filter((f) => f.description && !f.isInfographic)
-    .slice(0, 5);
-  if (keyFrames.length > 0) {
-    markdown += `## Key Moments\n\n`;
-
-    for (const keyFrame of keyFrames) {
-      markdown += `**At ${keyFrame.timestamp}s:** ${keyFrame.description}\n\n`;
-    }
+  // Add generated diagrams
+  if (diagrams && diagrams.trim().length > 0) {
+    markdown += `## Concept Diagrams\n\n${diagrams}\n\n`;
   }
 
   return markdown;
@@ -338,6 +383,20 @@ async function cleanup(videoPath: string): Promise<void> {
       fs.unlinkSync(videoPath);
     }
   } catch (error) {
-    console.error("Error cleaning up:", error);
+    console.error("Error cleaning up video:", error);
+  }
+}
+
+async function cleanupFrames(framesDir: string): Promise<void> {
+  try {
+    if (fs.existsSync(framesDir)) {
+      const files = fs.readdirSync(framesDir);
+      for (const file of files) {
+        fs.unlinkSync(path.join(framesDir, file));
+      }
+      fs.rmdirSync(framesDir);
+    }
+  } catch (error) {
+    console.error("Error cleaning up frames:", error);
   }
 }
